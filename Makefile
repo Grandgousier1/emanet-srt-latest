@@ -1,59 +1,97 @@
-IMAGE := emanet-srt:latest
-PLAYLIST := https://youtube.com/playlist?list=PLjhol17mPBuP_QR6Bs-_ocNllsIX86_qx
-ASR_MODEL := large-v3
-ASR_COMPUTE := float16           # ou int8_float16 pour économiser la VRAM
-ALIGN := 1                       # 1 = align WhisperX, 0 = sans
-LLM_MODEL := Qwen/Qwen2.5-7B-Instruct
-LLM_QUANT := int4
-LLM_WINDOW := 120
-STYLE := neutral                 # neutral | formal | informal
+# ==============================================================================
+# Makefile pour le projet Emanet-SRT
+# Conçu pour être exécuté directement sur un environnement pré-configuré (ex: RunPod).
+# ==============================================================================
 
-DOCKER_RUN := docker run --gpus all --rm -it \
-	-v $(PWD)/output:/app/output \
-	-v $(PWD)/workdir:/app/workdir \
-	-v $(PWD)/hf_cache:/app/hf_cache
+# --- Variables de configuration modifiables ---
+PLAYLIST_URL ?= "https://www.youtube.com/playlist?list=PLjhol17mPBuP_QR6Bs-_ocNllsIX86_qx"
+LOCAL_FILES ?= "" # Exemple: "media/video1.mp4 media/video2.mp3"
 
-build:
-	docker build -t $(IMAGE) -f Dockerfile .
+# Options ASR
+ASR_MODEL ?= "large-v3"
+ASR_COMPUTE_TYPE ?= "float16" # "float16", "int8_float16", "int8"
+NO_ALIGN ?= false # 'true' pour désactiver, 'false' pour activer
 
-bash:
-	$(DOCKER_RUN) --entrypoint bash $(IMAGE)
+# Options LLM
+LLM_MODEL ?= "mistralai/Magistral-Small-2507"
+LLM_QUANT ?= "int4" # "int4", "int8", "fp16"
+LLM_WINDOW_SEC ?= 120
+STYLE ?= "neutral" # "neutral", "formal", "informal"
+
+# Options SRT
+MAX_CPS ?= 17
+MAX_CHARS ?= 42
+
+# --- Commandes ---
+PYTHON := python3
+PIP := pip3
+CLI_ENTRY := $(PYTHON) emanet_srt.py
+
+# Construction des flags pour la commande
+# Si NO_ALIGN est 'true', on ajoute le flag --no-align
+ALIGN_FLAG := $(if $(filter true,$(NO_ALIGN)),--no-align,)
+
+PROCESS_ARGS = \
+	--output-dir "output" \
+	--work-dir "workdir" \
+	--asr-model "$(ASR_MODEL)" \
+	--asr-compute-type "$(ASR_COMPUTE_TYPE)" \
+	$(ALIGN_FLAG) \
+	--llm-model "$(LLM_MODEL)" \
+	--llm-quant "$(LLM_QUANT)" \
+	--llm-window-sec $(LLM_WINDOW_SEC) \
+	--style "$(STYLE)" \
+	--max-cps $(MAX_CPS) \
+	--max-chars $(MAX_CHARS) \
+	--save-debug-json \
+	--debug
+
+.PHONY: all help install run-playlist run-local health-check pull-models clean
+
+all: help
+
+help:
+	@echo "Makefile pour Emanet-SRT"
+	@echo ""
+	@echo "Cibles disponibles:"
+	@echo "  install         - Installe les dépendances Python via pip."
+	@echo "  run-playlist    - Lance le traitement sur la PLAYLIST_URL par défaut."
+	@echo "  run-local       - Lance le traitement sur les fichiers spécifiés dans LOCAL_FILES."
+	@echo "  health-check    - Exécute les tests d'intégrité de l'environnement."
+	@echo "  pull-models     - Pré-télécharge les modèles ASR et LLM dans le cache."
+	@echo "  clean           - Supprime les dossiers de travail et de sortie."
+	@echo ""
+	@echo "Vous pouvez surcharger les variables de configuration, ex:"
+	@echo "make run-local LOCAL_FILES='path/to/my/video.mp4' ASR_MODEL='medium'"
+
+install:
+	@echo "--- Installation des dépendances ---"
+	$(PIP) install --upgrade pip
+	$(PIP) install -r requirements.txt
+	@echo "--- Dépendances installées ---"
 
 run-playlist:
-	$(DOCKER_RUN) $(IMAGE) \
-	  --playlist-url "$(PLAYLIST)" \
-	  --asr-model $(ASR_MODEL) \
-	  --asr-compute-type $(ASR_COMPUTE) \
-	  $(if $(filter $(ALIGN),0),--no-align,) \
-	  --llm-model "$(LLM_MODEL)" \
-	  --llm-quant $(LLM_QUANT) \
-	  --llm-window-sec $(LLM_WINDOW) \
-	  --style $(STYLE) \
-	  --save-debug
+	@echo "--- Lancement du traitement sur la playlist : $(PLAYLIST_URL) ---"
+	$(CLI_ENTRY) process --playlist-url "$(PLAYLIST_URL)" $(PROCESS_ARGS)
 
 run-local:
-	@if [ -z "$(FILES)" ]; then echo "Usage: make run-local FILES='/media/ep1.mp4 /media/ep2.m4a'"; exit 1; fi
-	$(DOCKER_RUN) -v $(PWD)/media:/media $(IMAGE) \
-	  --local-files $(FILES) \
-	  --asr-model $(ASR_MODEL) \
-	  --asr-compute-type $(ASR_COMPUTE) \
-	  $(if $(filter $(ALIGN),0),--no-align,) \
-	  --llm-model "$(LLM_MODEL)" \
-	  --llm-quant $(LLM_QUANT) \
-	  --llm-window-sec $(LLM_WINDOW) \
-	  --style $(STYLE) \
-	  --save-debug
+	@if [ -z "$(LOCAL_FILES)" ]; then echo "Erreur: La variable LOCAL_FILES est vide. Usage: make run-local LOCAL_FILES=\"/path/to/file1.mp4\""; exit 1; fi
+	@echo "--- Lancement du traitement sur les fichiers locaux : $(LOCAL_FILES) ---"
+	$(CLI_ENTRY) process --local-files $(LOCAL_FILES) $(PROCESS_ARGS)
+
+health-check:
+	@echo "--- Lancement du test d'intégrité ---"
+	$(CLI_ENTRY) health-check --debug
 
 pull-models:
-	# Pré-télécharge les modèles dans le cache HF
-	$(DOCKER_RUN) --entrypoint python3 $(IMAGE) - << 'PY'
-from transformers import AutoTokenizer, AutoModelForCausalLM
-m = "Qwen/Qwen2.5-7B-Instruct"
-print("Pulling", m)
-tok = AutoTokenizer.from_pretrained(m, trust_remote_code=True)
-mdl = AutoModelForCausalLM.from_pretrained(m, trust_remote_code=True)
-print("OK")
-PY
+	@echo "--- Pré-téléchargement des modèles (cela peut prendre du temps) ---"
+	@echo "Modèle ASR: $(ASR_MODEL)"
+	$(PYTHON) -c "from emanet.transcriber import Transcriber; Transcriber(model_name='$(ASR_MODEL)')"
+	@echo "Modèle LLM: $(LLM_MODEL)"
+	$(PYTHON) -c "from emanet.translator import LLMTranslator; LLMTranslator(model_name='$(LLM_MODEL)')"
+	@echo "--- Modèles téléchargés ---"
 
 clean:
-	rm -rf output workdir hf_cache
+	@echo "--- Nettoyage des dossiers de travail ---"
+	rm -rf workdir output
+	@echo "--- Nettoyage terminé ---"
