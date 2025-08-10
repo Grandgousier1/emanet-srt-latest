@@ -158,3 +158,78 @@ def setup_logging(debug: bool = False):
         format="[%(asctime)s] [%(levelname)s] %(message)s",
         datefmt="%H:%M:%S",
     )
+
+class SileroVAD:
+    """Classe pour gérer le modèle Silero VAD et éviter les re-téléchargements."""
+    _model = None
+    _utils = None
+
+    @classmethod
+    def _load_model(cls):
+        if cls._model is None:
+            logger.info("Chargement du modèle Silero VAD...")
+            try:
+                import torch
+                # Le modèle sera mis en cache par torch.hub dans ~/.cache/torch/hub
+                cls._model, cls._utils = torch.hub.load(
+                    repo_or_dir='snakers4/silero-vad',
+                    model='silero_vad',
+                    force_reload=False,
+                    onnx=False  # Utilise PyTorch pour compatibilité CPU
+                )
+                logger.info("Modèle Silero VAD chargé.")
+            except Exception as e:
+                logger.error(f"Erreur lors du chargement du modèle Silero VAD: {e}")
+                raise
+
+    @classmethod
+    def get_speech_timestamps(cls, audio_path: str, min_speech_duration_ms: int = 250, min_silence_duration_ms: int = 100):
+        """
+        Détecte les segments de parole dans un fichier audio.
+
+        Args:
+            audio_path (str): Chemin vers le fichier audio (WAV, 16kHz mono).
+            min_speech_duration_ms (int): Durée minimale d'un segment de parole.
+            min_silence_duration_ms (int): Durée minimale d'un silence entre les segments.
+
+        Returns:
+            List[Dict[str, float]]: Liste de dictionnaires avec les clés 'start' et 'end' en secondes.
+        """
+        import torch
+        import torchaudio
+
+        cls._load_model()
+        if cls._model is None:
+            return []
+
+        try:
+            wav, sample_rate = torchaudio.load(audio_path)
+            if sample_rate != 16000:
+                # Resample si nécessaire
+                resampler = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=16000)
+                wav = resampler(wav)
+
+            if wav.shape[0] > 1: # Si stéréo, on prend la moyenne
+                wav = torch.mean(wav, dim=0, keepdim=True)
+
+        except Exception as e:
+            logger.error(f"Impossible de charger ou de traiter le fichier audio {audio_path}: {e}")
+            return []
+
+        (get_speech_timestamps_func, _, _, _, _) = cls._utils
+
+        timestamps = get_speech_timestamps_func(
+            wav,
+            cls._model,
+            sampling_rate=16000,
+            min_speech_duration_ms=min_speech_duration_ms,
+            min_silence_duration_ms=min_silence_duration_ms
+        )
+
+        # Conversion des échantillons en secondes
+        for ts in timestamps:
+            ts['start'] /= 16000
+            ts['end'] /= 16000
+
+        logger.info(f"VAD a trouvé {len(timestamps)} segments de parole dans {os.path.basename(audio_path)}.")
+        return timestamps

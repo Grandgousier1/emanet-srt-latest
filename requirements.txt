@@ -1,7 +1,11 @@
 yt-dlp>=2024.04.09
-faster-whisper>=1.0.0
-whisperx>=3.1
-transformers>=4.42.0
+# faster-whisper and whisperx removed to make space for Voxtral
+# torch, torchaudio, torchvision will be installed separately for CPU.
+# --- Voxtral & VAD dependencies ---
+mistral-common[audio]>=1.8.1
+# --- Updated for Voxtral support ---
+transformers>=4.54.0
+# ------------------------------------
 accelerate>=0.31.0
 sentencepiece>=0.1.99
 sacremoses>=0.0.53

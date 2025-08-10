@@ -4,173 +4,152 @@ import logging
 from typing import List, Optional
 
 import torch
+import torchaudio
 from tqdm import tqdm
 
 from .datastructures import Word, Segment
+from .utils import SileroVAD
 
 logger = logging.getLogger("emanet")
 
+# Tentative d'importation des bibliothèques liées à la transcription
 try:
-    from faster_whisper import WhisperModel
+    from transformers import AutoProcessor, VoxtralForConditionalGeneration
+    import bitsandbytes
+    HAS_VOXTRAL_DEPS = True
 except ImportError:
-    WhisperModel = None
-
-try:
-    import whisperx
-    HAS_WHISPERX = True
-except ImportError:
-    HAS_WHISPERX = False
+    HAS_VOXTRAL_DEPS = False
 
 
 class Transcriber:
     """
-    Gère la transcription audio en utilisant un modèle ASR (Automatic Speech Recognition).
-    Implémentation actuelle utilise faster-whisper, mais est conçue pour être adaptable.
+    Gère la transcription audio en utilisant le modèle Voxtral de Mistral.
+    Utilise SileroVAD pour la détection d'activité vocale en amont.
     """
     def __init__(
         self,
-        model_name: str = "large-v3",
-        device: str = "cuda",
-        compute_type: str = "float16",
+        model_name: str = "mistralai/Voxtral-Mini-3B-2507",
+        device: str = "cpu",
+        quant: Optional[str] = None,
         model_dir: Optional[str] = None,
-        use_whisperx_align: bool = True,
-        beam_size: int = 5,
-        best_of: int = 5,
-        no_speech_threshold: float = 0.6,
-        logprob_threshold: float = -1.25,
     ):
         """
-        Initialise le transcriber.
+        Initialise le transcriber avec Voxtral.
 
         Args:
-            model_name (str): Nom du modèle faster-whisper à utiliser.
+            model_name (str): Nom du modèle Voxtral à utiliser depuis Hugging Face.
             device (str): "cuda" ou "cpu".
-            compute_type (str): Type de calcul (ex: "float16", "int8_float16").
+            quant (Optional[str]): Type de quantification (ex: "int4", "int8").
+                                   Nécessite un GPU compatible.
             model_dir (Optional[str]): Dossier pour télécharger les modèles.
-            use_whisperx_align (bool): Activer/désactiver l'alignement avec WhisperX.
-            beam_size (int): Taille du faisceau pour le décodage.
-            best_of (int): Nombre de candidats à considérer.
-            no_speech_threshold (float): Seuil de probabilité pour filtrer les segments sans parole.
-            logprob_threshold (float): Seuil de log-probabilité pour filtrer les segments de faible confiance.
         """
-        if WhisperModel is None:
-            raise RuntimeError("faster-whisper n'est pas installé. Veuillez l'installer avec : pip install faster-whisper")
+        if not HAS_VOXTRAL_DEPS:
+            raise RuntimeError("Dépendances Voxtral non installées. Installez-les avec : pip install transformers bitsandbytes")
 
-        logger.info(f"Chargement du modèle de transcription ASR: {model_name} sur {device} ({compute_type})...")
-        # NOTE: Cette section est spécifique à faster-whisper. Pour implémenter Voxtral,
-        # un nouveau mécanisme de chargement sera nécessaire ici.
-        logger.info("NOTE : Le modèle Voxtral n'étant pas trouvable, nous utilisons faster-whisper comme solution de repli.")
+        self.device = device if torch.cuda.is_available() else "cpu"
+        logger.info(f"Initialisation du transcriber sur le device : {self.device}")
 
-        self.model_name = model_name
-        self.device = device
-        self.model = WhisperModel(model_name, device=device, compute_type=compute_type, download_root=model_dir)
+        quant_config = None
+        if self.device == "cuda":
+            if quant == "int8":
+                quant_config = bitsandbytes.BitsAndBytesConfig(load_in_8bit=True)
+                logger.info("Quantification 8-bit activée.")
+            elif quant == "int4":
+                quant_config = bitsandbytes.BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.float16)
+                logger.info("Quantification 4-bit activée.")
+        elif quant:
+            logger.warning(f"La quantification '{quant}' n'est supportée que sur GPU, elle est ignorée sur CPU.")
 
-        self.use_whisperx_align = use_whisperx_align and HAS_WHISPERX
-        if use_whisperx_align and not HAS_WHISPERX:
-            logger.warning("WhisperX n'est pas installé, l'alignement est désactivé. Installez-le avec 'pip install whisperx' si besoin.")
+        logger.info(f"Chargement du modèle de transcription Voxtral : {model_name}...")
+        self.processor = AutoProcessor.from_pretrained(model_name, cache_dir=model_dir)
+        self.model = VoxtralForConditionalGeneration.from_pretrained(
+            model_name,
+            torch_dtype=torch.bfloat16 if self.device == "cuda" else torch.float32,
+            quantization_config=quant_config,
+            cache_dir=model_dir,
+            low_cpu_mem_usage=True if self.device == "cuda" else False,
+        )
+        if quant_config is None:
+            self.model.to(self.device)
 
-        self.beam_size = beam_size
-        self.best_of = best_of
-        self.no_speech_threshold = no_speech_threshold
-        self.logprob_threshold = logprob_threshold
+        logger.info("Modèle Voxtral chargé.")
 
-    def transcribe(self, audio_path: str, language: str = "tr") -> List[Segment]:
+    def transcribe(self, audio_path: str, language: str) -> List[Segment]:
         """
-        Transcrire un fichier audio.
+        Transcrire un fichier audio en utilisant VAD + Voxtral.
 
         Args:
             audio_path (str): Chemin vers le fichier audio.
-            language (str): Code de la langue de l'audio (ex: "tr", "en").
+            language (str): Code de la langue de l'audio (ex: "fr", "en").
 
         Returns:
             List[Segment]: Une liste de segments transcrits.
         """
-        logger.info(f"Transcription de {os.path.basename(audio_path)}...")
+        logger.info(f"Lancement de la VAD pour {os.path.basename(audio_path)}...")
         t0 = time.time()
 
-        it, info = self.model.transcribe(
-            audio_path, language=language, vad_filter=True,
-            vad_parameters={"min_silence_duration_ms": 500},
-            beam_size=self.beam_size, best_of=self.best_of,
-            temperature=0.0, patience=0.0, word_timestamps=True,
-            condition_on_previous_text=True,
-        )
+        speech_timestamps = SileroVAD.get_speech_timestamps(audio_path)
+        if not speech_timestamps:
+            logger.warning("Aucun segment de parole détecté par la VAD.")
+            return []
 
-        segments = []
-        total_duration = round(info.duration)
+        logger.info(f"Transcription de {len(speech_timestamps)} segments de parole...")
 
-        with tqdm(total=total_duration, unit="s", desc="Transcription ASR") as pbar:
-            for seg in it:
-                words = [Word(w.word, w.start, w.end) for w in seg.words if w.word.strip()] if seg.words else None
-                segments.append(Segment(
-                    start=seg.start, end=seg.end, text=seg.text.strip(),
-                    words=words, avg_logprob=getattr(seg, "avg_logprob", None),
-                    no_speech_prob=getattr(seg, "no_speech_prob", None),
-                ))
-                pbar.update(round(seg.end - pbar.n))
+        full_audio, sample_rate = torchaudio.load(audio_path)
+        if sample_rate != 16000:
+            resampler = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=16000)
+            full_audio = resampler(full_audio)
+            sample_rate = 16000
 
-        logger.info(f"Transcription terminée en {time.time() - t0:.1f}s — {len(segments)} segments trouvés.")
+        all_segments = []
 
-        segments = self._filter_segments(segments)
+        with tqdm(total=len(speech_timestamps), unit="segment", desc="Transcription Voxtral") as pbar:
+            for chunk in speech_timestamps:
+                start_time, end_time = chunk['start'], chunk['end']
 
-        if self.use_whisperx_align:
-            try:
-                segments = self._align_with_whisperx(audio_path, segments, language)
-            except Exception as e:
-                logger.warning(f"L'alignement WhisperX a échoué ({e}) — on continue sans.")
+                # Extrait le segment audio
+                audio_chunk = full_audio[:, int(start_time * sample_rate):int(end_time * sample_rate)]
 
-        return segments
+                inputs = self.processor.apply_transcription_request(
+                    audio=audio_chunk.squeeze(0),
+                    sampling_rate=sample_rate,
+                    language=language,
+                    model_id=self.model.config.name_or_path,
+                    return_timestamps="word"
+                )
 
-    def _filter_segments(self, segments: List[Segment]) -> List[Segment]:
-        """Filtre les segments transcrits en fonction des seuils de confiance."""
-        initial_count = len(segments)
-        filtered = [
-            s for s in segments
-            if (s.no_speech_prob is None or s.no_speech_prob <= self.no_speech_threshold)
-            and (s.avg_logprob is None or s.avg_logprob >= self.logprob_threshold)
-        ]
-        if initial_count != len(filtered):
-            logger.info(f"{initial_count - len(filtered)} segments de faible confiance ont été filtrés.")
-        return filtered
+                inputs = inputs.to(self.device, dtype=torch.bfloat16 if self.device == "cuda" else torch.float32)
 
-    def _align_with_whisperx(self, audio_path: str, segments: List[Segment], language: str) -> List[Segment]:
-        """Aligne les segments transcrits au niveau du mot en utilisant WhisperX."""
-        if not HAS_WHISPERX:
-            return segments
+                with torch.no_grad():
+                    result = self.model.generate(**inputs, max_new_tokens=500)
 
-        logger.info("Alignement mot-à-mot avec WhisperX...")
-        device = self.device if torch.cuda.is_available() else "cpu"
+                decoded = self.processor.batch_decode(
+                    result.sequences,
+                    skip_special_tokens=True,
+                    output_word_offsets=True
+                )
 
-        try:
-            align_model, metadata = whisperx.load_align_model(language_code=language, device=device)
-        except Exception as e:
-            logger.error(f"Impossible de charger le modèle d'alignement WhisperX pour la langue '{language}'. Erreur: {e}")
-            return segments
+                if decoded and decoded[0]:
+                    transcription = decoded[0][0]
+                    text = transcription["text"]
+                    word_offsets = transcription.get("word_offsets", [])
 
-        wx_segments = [{"start": s.start, "end": s.end, "text": s.text} for s in segments]
+                    words = [Word(w['word'], w['start_offset'], w['end_offset']) for w in word_offsets]
 
-        try:
-            result = whisperx.align(
-                transcript={"segments": wx_segments}, align_model=align_model,
-                audio=audio_path, device=device,
-            )
-        except Exception as e:
-            logger.error(f"Erreur lors de l'exécution de l'alignement WhisperX : {e}")
-            return segments
+                    # Ajuste les timestamps des mots pour être relatifs à l'audio complet
+                    for word in words:
+                        word.start += start_time
+                        word.end += start_time
 
-        aligned = []
-        for s, wx in zip(segments, result["segments"]):
-            words = []
-            if "words" in wx:
-                for w in wx.get("words", []):
-                    if "start" in w and "end" in w and "word" in w and w["start"] is not None:
-                        words.append(Word(w["word"], float(w["start"]), float(w["end"])))
+                    segment = Segment(
+                        start=start_time,
+                        end=end_time,
+                        text=text.strip(),
+                        words=words
+                    )
+                    all_segments.append(segment)
 
-            # Si l'alignement a échoué pour ce segment, on garde les mots originaux de Whisper
-            if not words and s.words:
-                words = s.words
+                pbar.update(1)
 
-            aligned.append(Segment(start=wx["start"], end=wx["end"], text=wx["text"].strip(), words=words))
-
-        logger.info(f"Alignement WhisperX terminé — {len(aligned)} segments alignés.")
-        return aligned
+        logger.info(f"Transcription terminée en {time.time() - t0:.1f}s — {len(all_segments)} segments trouvés.")
+        return all_segments
