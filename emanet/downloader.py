@@ -1,10 +1,12 @@
 import os
 import logging
 import subprocess
-from typing import List, Optional, Dict
+import time
+import random
+from typing import List, Optional, Dict, Tuple
 
 from tqdm import tqdm
-from .utils import ensure_dir, run_cmd, to_srt_timestamp
+from .utils import ensure_dir, run_cmd
 
 logger = logging.getLogger("emanet")
 
@@ -13,147 +15,140 @@ try:
 except ImportError:
     YoutubeDL = None
 
+# User-Agent commun pour paraître moins comme un script
+COMMON_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+
 class _TqdmYouTubeLogger:
-    """A custom yt-dlp logger that integrates with a tqdm progress bar."""
+    """Un logger yt-dlp personnalisé qui s'intègre à une barre de progression tqdm."""
     def __init__(self, pbar: tqdm):
         self.pbar = pbar
 
-    def debug(self, msg):
-        # yt-dlp requires a debug method, but we ignore its logs
-        pass
+    def debug(self, msg): pass
+    def info(self, msg): pass
+    def warning(self, msg): logger.warning(f"[yt-dlp] {msg}")
+    def error(self, msg): logger.error(f"[yt-dlp] {msg}")
 
-    def info(self, msg):
-        # We can log this if needed, e.g., for debugging yt-dlp behavior
-        pass
-
-    def warning(self, msg):
-        logger.warning(f"[yt-dlp] {msg}")
-
-    def error(self, msg):
-        logger.error(f"[yt-dlp] {msg}")
-
-
-def _pbar_hook(d, pbar: tqdm):
-    """A yt-dlp progress hook that updates a tqdm progress bar."""
-    if d['status'] == 'downloading':
-        if pbar.total is None: # Set total size if not already set
-            pbar.total = d.get('total_bytes') or d.get('total_bytes_estimate')
-        pbar.update(d['downloaded_bytes'] - pbar.n)
-    elif d['status'] == 'finished':
-        if pbar.total is None:
-            pbar.total = pbar.n
-        else:
-            pbar.n = pbar.total
-        pbar.close()
-
+def _create_pbar_hook(pbar: tqdm, state: Dict):
+    """Crée un hook de progression pour yt-dlp qui met à jour une barre tqdm et capture le nom de fichier."""
+    def hook(d):
+        if d['status'] == 'downloading':
+            if pbar.total is None:
+                pbar.total = d.get('total_bytes') or d.get('total_bytes_estimate')
+            pbar.update(d['downloaded_bytes'] - pbar.n)
+        elif d['status'] == 'finished':
+            if pbar.total is None: pbar.total = pbar.n
+            else: pbar.n = pbar.total
+            state['filename'] = d.get('filename')
+            pbar.close()
+    return hook
 
 class YouTubeAudioDownloader:
     """
-    Handles downloading and preparing audio from YouTube playlists or local files.
+    Gère le téléchargement et la préparation de l'audio depuis YouTube.
     """
-    def __init__(self, workdir: str, cookies: Optional[str] = None):
+    def __init__(
+        self,
+        workdir: str,
+        cookies: Optional[str] = None,
+        user_agent: Optional[str] = None,
+        download_delay: Tuple[float, float] = (1.0, 5.0)
+    ):
         """
         Initialise le downloader.
-
         Args:
             workdir (str): Dossier de travail pour stocker les fichiers audio.
             cookies (Optional[str]): Chemin vers un fichier de cookies pour yt-dlp.
+            user_agent (str): User-Agent à utiliser pour les requêtes.
+            download_delay (Tuple[float, float]): Délai aléatoire (min, max) en secondes entre les téléchargements.
         """
         if YoutubeDL is None:
             raise RuntimeError("yt-dlp n'est pas installé. Veuillez l'installer avec : pip install yt-dlp")
         self.workdir = workdir
         self.cookies = cookies
+        self.user_agent = user_agent or COMMON_USER_AGENT
+        self.download_delay = download_delay
         ensure_dir(workdir)
 
     def download_playlist(self, url: str) -> List[Dict]:
         """
         Télécharge l'audio de toutes les vidéos d'une playlist YouTube.
-
-        Args:
-            url (str): L'URL de la playlist YouTube.
-
-        Returns:
-            List[Dict]: Une liste de dictionnaires, un pour chaque vidéo téléchargée avec succès.
         """
         base_ydl_opts = {
             "ignoreerrors": True,
             "format": "bestaudio/best",
-            "postprocessors": [
-                {"key": "FFmpegExtractAudio", "preferredcodec": "m4a", "preferredquality": "192"},
-            ],
-            "noprogress": True,
-            "quiet": True,
-            "retries": 10,
-            "fragment_retries": 10,
+            "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "m4a", "preferredquality": "192"}],
+            "noprogress": True, "quiet": True, "retries": 10, "fragment_retries": 10,
+            "http_headers": {"User-Agent": self.user_agent},
         }
         if self.cookies and os.path.isfile(self.cookies):
             base_ydl_opts["cookiefile"] = self.cookies
 
         logger.info("Analyse de la playlist YouTube...")
-        with YoutubeDL(base_ydl_opts) as ydl:
-            try:
+        try:
+            with YoutubeDL(base_ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
                 if not info or not info.get("entries"):
-                    logger.error("Impossible de récupérer les informations de la playlist. L'URL est-elle correcte ou la playlist est-elle privée/protégée ?")
+                    logger.error("Impossible de récupérer les infos de la playlist. URL incorrecte ou playlist privée/protégée?")
                     return []
                 entries = info.get("entries", [])
-            except Exception as e:
-                logger.error(f"Erreur lors de l'analyse de la playlist : {e}")
-                return []
+        except Exception as e:
+            logger.error(f"Erreur lors de l'analyse de la playlist : {e}")
+            return []
 
         logger.info(f"{len(entries)} vidéo(s) trouvée(s) dans la playlist.")
-
         results = []
         for entry in tqdm(entries, desc="Téléchargement audio", unit="vidéo"):
-            if not entry:
-                continue
+            if not entry: continue
 
             vid_id = entry.get("id")
             playlist_idx = entry.get("playlist_index", len(results) + 1)
             title = entry.get("title") or f"video-{vid_id}"
 
-            # NOTE: Le nom du fichier de sortie est construit à partir du template.
-            # C'est généralement fiable, mais la méthode la plus robuste serait
-            # de capturer le nom de fichier final via le hook de progression.
-            # L'approche actuelle est un compromis pour la simplicité.
-            outtmpl = os.path.join(self.workdir, f"{playlist_idx}-{vid_id}.%(ext)s")
-            download_opts = {**base_ydl_opts, "outtmpl": outtmpl}
+            # Nom de fichier de sortie prévisible
+            outtmpl = os.path.join(self.workdir, f"{playlist_idx:03d}-{vid_id}.%(ext)s")
+            potential_path = os.path.join(self.workdir, f"{playlist_idx:03d}-{vid_id}.m4a")
 
-            # On ne retélécharge pas si le fichier existe déjà
-            # Pour cela, on doit deviner le nom de fichier potentiel
-            potential_path = os.path.join(self.workdir, f"{playlist_idx}-{vid_id}.m4a")
             if os.path.exists(potential_path):
                  logger.info(f"Fichier déjà téléchargé pour '{title}'. On passe.")
                  results.append({"id": vid_id, "index": playlist_idx, "title": title, "m4a": potential_path})
                  continue
 
+            # Appliquer un délai pour un comportement plus humain
+            delay = random.uniform(*self.download_delay)
+            logger.debug(f"Pause de {delay:.1f}s avant le prochain téléchargement.")
+            time.sleep(delay)
+
+            hook_state = {'filename': None}
+            download_opts = {**base_ydl_opts, "outtmpl": outtmpl}
+
             with tqdm(total=None, unit='B', unit_scale=True, desc=f"Vidéo {playlist_idx}", leave=False) as pbar:
-                download_opts["progress_hooks"] = [lambda d, p=pbar: _pbar_hook(d, p)]
+                download_opts["progress_hooks"] = [_create_pbar_hook(pbar, hook_state)]
                 download_opts["logger"] = _TqdmYouTubeLogger(pbar)
 
                 with YoutubeDL(download_opts) as ydl_download:
                     try:
-                        ydl_download.download([entry["webpage_url"]])
+                        # On utilise `extract_info` avec download=True pour s'assurer que le hook reçoit bien les infos
+                        ydl_download.extract_info(entry["webpage_url"], download=True)
                     except Exception as e:
                         logger.error(f"Échec du téléchargement pour la vidéo '{title}': {e}")
                         continue
 
-            # Recherche du fichier téléchargé, car l'extension peut varier
-            downloaded_path = None
-            for fname in os.listdir(self.workdir):
-                if fname.startswith(f"{playlist_idx}-{vid_id}."):
-                    downloaded_path = os.path.join(self.workdir, fname)
-                    break
-
+            downloaded_path = hook_state.get('filename')
             if downloaded_path and os.path.exists(downloaded_path):
                 results.append({"id": vid_id, "index": playlist_idx, "title": title, "m4a": downloaded_path})
             else:
-                logger.warning(f"Fichier audio non trouvé pour la vidéo '{title}' après tentative de téléchargement.")
+                # Fallback: si le hook a échoué mais que le fichier existe quand même
+                if os.path.exists(potential_path):
+                    logger.warning(f"Le hook n'a pas retourné de chemin, mais le fichier a été trouvé à l'emplacement attendu pour '{title}'.")
+                    results.append({"id": vid_id, "index": playlist_idx, "title": title, "m4a": potential_path})
+                else:
+                    logger.warning(f"Fichier audio non trouvé pour '{title}' après tentative de téléchargement.")
 
         logger.info(f"{len(results)}/{len(entries)} audios de la playlist sont prêts pour le traitement.")
         return results
 
-    def convert_to_wav(self, in_path: str, out_wav: str, sr: int = 16000):
+    @staticmethod
+    def convert_to_wav(in_path: str, out_wav: str, sr: int = 16000):
         """
         Convertit un fichier audio en format WAV mono 16kHz avec FFmpeg.
 

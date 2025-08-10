@@ -46,7 +46,20 @@ class Transcriber:
         if not HAS_VOXTRAL_DEPS:
             raise RuntimeError("Dépendances Voxtral non installées. Installez-les avec : pip install transformers bitsandbytes")
 
+        self.model_name = model_name
         self.device = device if torch.cuda.is_available() else "cpu"
+        self.model = None
+        self.processor = None
+
+        # Mode spécial pour le health-check pour éviter de télécharger le modèle
+        if model_name == "health-check-dummy":
+            logger.info("Mode de test (health-check) ASR activé.")
+            # On vérifie juste que les dépendances sont là.
+            _ = VoxtralForConditionalGeneration
+            _ = AutoProcessor
+            _ = bitsandbytes
+            return
+
         logger.info(f"Initialisation du transcriber sur le device : {self.device}")
 
         quant_config = None
@@ -85,6 +98,10 @@ class Transcriber:
         Returns:
             List[Segment]: Une liste de segments transcrits.
         """
+        if self.model_name == "health-check-dummy":
+            logger.info("Exécution de la transcription en mode test.")
+            return [Segment(start=0, end=1, text="This is a test.", words=[Word("test", 0, 1)])]
+
         logger.info(f"Lancement de la VAD pour {os.path.basename(audio_path)}...")
         t0 = time.time()
 

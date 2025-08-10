@@ -22,7 +22,9 @@ class LLMTranslator:
         window_sec: int = 120,
         style: str = "neutral",  # "neutral", "formal", "informal"
         max_new_tokens: int = 2048,
-        batch_size: int = 8, # Ajout d'un paramètre pour la taille du lot
+        batch_size: int = 8,
+        source_lang: str = "turc",
+        target_lang: str = "français",
     ):
         """
         Initialise le traducteur LLM.
@@ -34,6 +36,8 @@ class LLMTranslator:
             style (str): Style de traduction ("neutral", "formal", "informal").
             max_new_tokens (int): Nombre maximum de tokens à générer.
             batch_size (int): Taille du lot pour l'inférence.
+            source_lang (str): Langue source pour la traduction.
+            target_lang (str): Langue cible pour la traduction.
         """
         self.model_name = model_name
         self.quant = quant
@@ -41,6 +45,8 @@ class LLMTranslator:
         self.style = style
         self.max_new_tokens = max_new_tokens
         self.batch_size = batch_size
+        self.source_lang = source_lang
+        self.target_lang = target_lang
 
         logger.info(f"Chargement du LLM traducteur: {model_name} (quant: {quant}, batch_size: {batch_size})...")
 
@@ -80,7 +86,7 @@ class LLMTranslator:
         }
         style_txt = style_map.get(self.style, style_map["neutral"])
         return (
-            "Tu es un traducteur expert spécialisé dans la traduction du turc vers le français. "
+            f"Tu es un traducteur expert spécialisé dans la traduction du {self.source_lang} vers le {self.target_lang}. "
             "Ta traduction doit être fidèle au sens original, idiomatique et fluide. "
             f"Adopte {style_txt}. Ne fournis AUCUNE note, explication ou commentaire. "
             "Réponds uniquement avec le texte traduit. Conserve les sauts de ligne du texte source."

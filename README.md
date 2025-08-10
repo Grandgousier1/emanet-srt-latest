@@ -7,13 +7,13 @@ L'outil est conçu pour fonctionner à 100% en local sur une machine équipée d
 ## Fonctionnalités
 
 - **Téléchargement depuis YouTube** : Gère les playlists complètes en téléchargeant uniquement l'audio pour un traitement efficace.
-- **Transcription ASR de Haute Qualité** : Utilise `faster-whisper` (une implémentation optimisée de Whisper d'OpenAI) pour une transcription rapide et précise.
-- **Traduction par LLM** : Emploie un grand modèle de langage de la famille `Mistral-Small` pour une traduction contextuelle et nuancée du turc vers le français.
+- **Transcription ASR de Haute Qualité** : Utilise un modèle de la famille `Voxtral` de Mistral AI pour une transcription rapide et précise avec horodatage au niveau du mot.
+- **Traduction par LLM** : Emploie un grand modèle de langage (par défaut `Magistral-Small`) pour une traduction contextuelle et nuancée.
 - **Synchronisation Intelligente** : Génère des sous-titres bien synchronisés en se basant sur l'horodatage des mots de l'audio original.
 - **CLI Robuste et Conviviale** : Interface en ligne de commande basée sur `Typer` avec des commandes claires, des options documentées et des barres de progression pour chaque étape.
 - **Test d'Intégrité** : Inclut une commande `health-check` pour valider l'environnement, les dépendances et le fonctionnement des modèles.
-- **Haute Configurabilité** : La plupart des paramètres (modèles, seuils, etc.) sont configurables via le `Makefile` ou directement en ligne de commande.
-- **Optimisé pour la Performance** : Inclut des optimisations telles que la quantification des modèles (4-bit) et le traitement par lots (batching) pour la traduction afin de maximiser l'utilisation du GPU.
+- **Haute Configurabilité** : La plupart des paramètres (modèles, quantification, etc.) sont configurables via le `Makefile` ou directement en ligne de commande.
+- **Optimisé pour la Performance** : Inclut des optimisations telles que la quantification des modèles (`int4`, `int8`) et le traitement par lots (batching) pour maximiser l'utilisation du GPU.
 
 ---
 
@@ -48,7 +48,7 @@ L'outil est conçu pour fonctionner à 100% en local sur une machine équipée d
     ```bash
     make install
     ```
-    Cette commande installera `PyTorch` pour CUDA, `faster-whisper`, `transformers`, et les autres bibliothèques nécessaires.
+    Cette commande installera `PyTorch` pour CUDA, `transformers`, `bitsandbytes` et les autres bibliothèques nécessaires.
 
 ---
 
@@ -108,23 +108,16 @@ Vous pouvez facilement modifier le comportement de l'outil en ajustant les varia
 
 - **`PLAYLIST_URL`**: L'URL de la playlist YouTube à traiter par défaut.
 - **`LOCAL_FILES`**: Une chaîne de caractères contenant les chemins des fichiers locaux à traiter.
-- **`ASR_MODEL`**: Le modèle `faster-whisper` à utiliser (ex: `large-v3`, `medium`, `small`).
-- **`LLM_MODEL`**: Le modèle de langage à utiliser pour la traduction.
+- **`ASR_MODEL`**: Le modèle de transcription `Voxtral` à utiliser (ex: `mistralai/Voxtral-Mini-3B-2507`).
+- **`ASR_QUANT`**: La quantification à appliquer au modèle ASR (`int4`, `int8`). Laisser vide pour du float16/32.
+- **`LLM_MODEL`**: Le modèle de langage à utiliser pour la traduction (ex: `mistralai/Magistral-Small-2507`).
 - **`LLM_QUANT`**: La quantification à appliquer au LLM (`int4`, `int8`, `fp16`) pour optimiser l'usage mémoire.
 - **`LLM_BATCH_SIZE`**: La taille du lot pour la traduction. Augmentez sur les GPU puissants pour plus de vitesse.
 
 Toutes ces variables peuvent être surchargées directement depuis la ligne de commande :
 ```bash
-make run-playlist ASR_MODEL="medium" LLM_BATCH_SIZE=16
+make run-playlist ASR_MODEL="mistralai/Voxtral-Mini-..." ASR_QUANT="int8"
 ```
-
----
-
-### Note sur le modèle de transcription Voxtral
-
-La demande initiale spécifiait l'utilisation du modèle `Voxtral-Mini` de Mistral AI. Cependant, au moment du développement, ce modèle n'était pas publiquement disponible en version open-source téléchargeable sur Hugging Face.
-
-Pour contourner ce problème, l'application utilise `faster-whisper` (avec `large-v3` par défaut), qui est une alternative de pointe. Le code du module `emanet/transcriber.py` a été conçu de manière modulaire pour permettre de remplacer facilement `faster-whisper` par `Voxtral` lorsque celui-ci deviendra disponible.
 
 ---
 

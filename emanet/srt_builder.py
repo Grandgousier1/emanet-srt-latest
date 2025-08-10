@@ -40,13 +40,14 @@ class SRTBuilder:
         self.max_duration = max_duration
         self.gap = gap_between_cues
 
-    def build_from_segments(self, segments: List[Segment], translated_texts: List[str]) -> List[Cue]:
+    def build_from_segments(self, segments: List[Segment], translated_texts: List[str], target_lang_code: str = "fr") -> List[Cue]:
         """
         Point d'entrée principal pour construire les sous-titres.
 
         Args:
             segments (List[Segment]): Segments transcrits de l'audio original.
             translated_texts (List[str]): Blocs de texte correspondants, traduits.
+            target_lang_code (str): Code de la langue cible (ex: "fr") pour les règles spécifiques.
 
         Returns:
             List[Cue]: Une liste d'objets Cue prêts à être écrits dans un fichier SRT.
@@ -57,13 +58,16 @@ class SRTBuilder:
             logger.warning("Aucun mot source avec horodatage trouvé. Impossible de construire le SRT.")
             return []
 
-        # 2. Concaténer et tokeniser le texte français traduit.
+        # 2. Concaténer et tokeniser le texte traduit.
         full_translated_text = " ".join([normalize_whitespace(t) for t in translated_texts])
-        full_translated_text = french_typography_fix(full_translated_text)
-        fr_tokens = re.findall(r"\S+|\s+", full_translated_text)
+        if target_lang_code == "fr":
+            logger.debug("Application des corrections typographiques pour le français.")
+            full_translated_text = french_typography_fix(full_translated_text)
+
+        tr_tokens = re.findall(r"\S+|\s+", full_translated_text)
 
         # 3. Créer les cues en se basant sur le timing des mots sources et le texte traduit.
-        cues = self._create_cues(source_words, fr_tokens)
+        cues = self._create_cues(source_words, tr_tokens)
 
         # 4. Ajuster finement les timings pour éviter les chevauchements et respecter les durées.
         cues = self._adjust_timings(cues)
@@ -81,14 +85,14 @@ class SRTBuilder:
         source_words.sort(key=lambda w: (w.start, w.end))
         return source_words
 
-    def _create_cues(self, source_words: List[Word], fr_tokens: List[str]) -> List[Cue]:
+    def _create_cues(self, source_words: List[Word], tr_tokens: List[str]) -> List[Cue]:
         """Algorithme de création de sous-titres."""
         cues: List[Cue] = []
         word_idx, token_idx, cue_idx = 0, 0, 1
 
-        pbar = tqdm(total=len(fr_tokens), desc="Création des sous-titres")
+        pbar = tqdm(total=len(tr_tokens), desc="Création des sous-titres")
 
-        while word_idx < len(source_words) and token_idx < len(fr_tokens):
+        while word_idx < len(source_words) and token_idx < len(tr_tokens):
             # 1. Définir une fenêtre temporelle à partir des mots sources.
             start_t = source_words[word_idx].start
 
@@ -110,8 +114,8 @@ class SRTBuilder:
             current_text = ""
             tokens_in_cue_count = 0
             temp_token_idx = token_idx
-            while temp_token_idx < len(fr_tokens):
-                token = fr_tokens[temp_token_idx]
+            while temp_token_idx < len(tr_tokens):
+                token = tr_tokens[temp_token_idx]
                 if not self._can_add_token(token, start_t, end_t, current_text):
                     break
                 current_text += token
@@ -133,7 +137,7 @@ class SRTBuilder:
         pbar.close()
 
         # 6. Gérer le texte restant qui n'a pas pu être placé.
-        remainder = "".join(fr_tokens[token_idx:]).strip()
+        remainder = "".join(tr_tokens[token_idx:]).strip()
         if remainder:
             start_t = cues[-1].end + self.gap if cues else 0.0
             end_t = start_t + min(self.max_duration, max(self.min_duration, len(remainder) / self.max_cps))

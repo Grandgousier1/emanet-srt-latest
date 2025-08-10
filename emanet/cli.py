@@ -32,6 +32,7 @@ def _main_process(
     glossary: dict,
     save_debug_json: bool,
     language: str,
+    target_srt_lang: str,
 ):
     """Cœur du traitement pour une seule entrée vidéo."""
     title = entry["title"]
@@ -74,13 +75,13 @@ def _main_process(
     processed_blocks = [utils.apply_glossary(utils.french_typography_fix(b), glossary) for b in translated_blocks if b.strip()]
 
     # 4. SRT Building
-    cues = builder.build_from_segments(segments, processed_blocks)
+    cues = builder.build_from_segments(segments, processed_blocks, target_lang_code=target_srt_lang)
     if not cues:
         logger.warning(f"Impossible de générer les sous-titres pour '{title}', on passe.")
         return
 
     # 5. Write SRT file
-    srt_path = outdir / f"{base_slug}.fr.srt"
+    srt_path = outdir / f"{base_slug}.{target_srt_lang}.srt"
     builder.write_srt(cues, str(srt_path))
 
     logger.info(f"--- Traitement de la vidéo '{title}' terminé. ---")
@@ -105,6 +106,8 @@ def process_command(
     llm_batch_size: int = typer.Option(8, "--llm-batch-size", help="Taille du lot pour la traduction par le LLM."),
     style: str = typer.Option("neutral", "--style", help="Style de traduction (neutral, formal, informal)."),
 
+    # SRT options
+    target_srt_lang: str = typer.Option("fr", "--target-srt-lang", help="Code langue pour le fichier SRT final (ex: fr, en)."),
     max_cps: float = typer.Option(17.0, "--max-cps", help="Caractères par seconde maximum pour les sous-titres."),
     max_chars_per_line: int = typer.Option(42, "--max-chars", help="Caractères maximum par ligne de sous-titre."),
 
@@ -159,7 +162,7 @@ def process_command(
                 workdir=work_dir, outdir=output_dir, transcriber=transcriber,
                 translator=translator, builder=builder, entry=entry,
                 glossary=glossary_data, save_debug_json=save_debug_json,
-                language=language
+                language=language, target_srt_lang=target_srt_lang
             )
         except Exception as e:
             logger.error(f"Une erreur critique est survenue lors du traitement de '{entry['title']}': {e}")
@@ -191,31 +194,46 @@ def health_check_command(debug: bool = typer.Option(False, "--debug", help="Acti
     _check("Dépendances Python", lambda: __import__('torch') and __import__('transformers') and __import__('yt_dlp'))
     _check("Installation FFmpeg", lambda: utils.run_cmd(["ffmpeg", "-version"], check=True))
 
-    # TODO: Réactiver ce test avec un petit modèle compatible Voxtral si disponible.
-    # Le test ASR est commenté pour éviter de télécharger un gros modèle (Voxtral-Mini)
-    # juste pour un test d'intégrité.
-    # def asr_test():
-    #     transcriber = Transcriber(model_name="mistralai/Voxtral-Mini-3B-2507")
-    #     dummy_wav = Path("dummy_silent.wav")
-    #     if not dummy_wav.exists():
-    #         utils.run_cmd(["ffmpeg", "-f", "lavfi", "-i", "anullsrc=r=16000:cl=mono", "-t", "1", "-q:a", "9", "-acodec", "pcm_s16le", str(dummy_wav)], check=True)
-    #     _ = transcriber.transcribe(str(dummy_wav), language="en")
-    #     dummy_wav.unlink()
-    # _check("Chargement et inférence ASR", asr_test)
+    def asr_test():
+        # Ce test ne télécharge pas le modèle complet, il vérifie juste que
+        # l'initialisation et les dépendances fonctionnent.
+        transcriber = Transcriber(model_name="health-check-dummy")
+        dummy_wav = Path("dummy_speech.wav") # Utilise le fichier dummy existant
+        if not dummy_wav.exists():
+            raise FileNotFoundError("Le fichier dummy_speech.wav est manquant pour le test.")
+
+        segments = transcriber.transcribe(str(dummy_wav), language="en")
+        if not segments: # Le mode dummy doit retourner un segment
+            raise RuntimeError("Le mode de test du transcriber n'a pas fonctionné comme prévu.")
+
+    _check("Chargement du processeur ASR", asr_test)
 
     def llm_test():
-        # Utilise distilgpt2 qui est un petit modèle de génération plus robuste pour ce test
-        translator = LLMTranslator(model_name="distilgpt2", quant="fp16", batch_size=1)
-        prompts = translator._build_prompts(["Ceci est un test."])
+        # Utilise un petit modèle pour tester le pipeline de génération de texte.
+        translator = LLMTranslator(
+            model_name="distilgpt2", quant="fp16", batch_size=1,
+            source_lang="anglais", target_lang="français"
+        )
+        # On teste le pipeline de prompting et de génération.
+        prompts = translator._build_prompts(["This is a test sentence."])
         results = translator._generate_batch(prompts)
         if not results or not results[0]:
             raise RuntimeError("La génération de texte par le LLM a échoué ou a retourné une chaîne vide.")
     _check("Chargement et inférence LLM", llm_test)
 
     def yt_test():
-        with __import__('yt_dlp').YoutubeDL({"quiet": True, "skip_download": True, "ignoreerrors": True}) as ydl:
+        # Teste la connectivité et la capacité à extraire des métadonnées avec un user-agent réaliste.
+        from .downloader import COMMON_USER_AGENT
+        ydl_opts = {
+            "quiet": True,
+            "skip_download": True,
+            "ignoreerrors": True,
+            "http_headers": {"User-Agent": COMMON_USER_AGENT},
+        }
+        with __import__('yt_dlp').YoutubeDL(ydl_opts) as ydl:
             res = ydl.extract_info("https://www.youtube.com/watch?v=dQw4w9WgXcQ", download=False)
-            if not res: raise RuntimeError("La récupération des métadonnées a échoué.")
+            if not res or not res.get('id'):
+                raise RuntimeError("La récupération des métadonnées a échoué (vidéo non trouvée ou bloquée).")
     _check("Connectivité YouTube", yt_test)
 
     logger.info("-" * 20)

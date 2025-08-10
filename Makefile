@@ -8,11 +8,8 @@ PLAYLIST_URL ?= "https://www.youtube.com/playlist?list=PLjhol17mPBuP_QR6Bs-_ocNl
 LOCAL_FILES ?= "" # Exemple: "media/video1.mp4 media/video2.mp3"
 
 # Options ASR
-ASR_MODEL ?= "large-v3"
-ASR_COMPUTE_TYPE ?= "float16" # "float16", "int8_float16", "int8"
-NO_ALIGN ?= false # 'true' pour désactiver, 'false' pour activer
-NO_SPEECH_THRESHOLD ?= 0.6
-LOGPROB_THRESHOLD ?= -1.25
+ASR_MODEL ?= "mistralai/Voxtral-Mini-3B-2507"
+ASR_QUANT ?= "int4" # "int4", "int8", ou laisser vide pour du float
 
 # Options LLM
 LLM_MODEL ?= "mistralai/Magistral-Small-2507"
@@ -31,17 +28,14 @@ PIP := pip3
 CLI_ENTRY := $(PYTHON) emanet_srt.py
 
 # Construction des flags pour la commande
-# Si NO_ALIGN est 'true', on ajoute le flag --no-align
-ALIGN_FLAG := $(if $(filter true,$(NO_ALIGN)),--no-align,)
+# Si ASR_QUANT a une valeur, on ajoute le flag --asr-quant
+ASR_QUANT_FLAG := $(if $(ASR_QUANT),--asr-quant $(ASR_QUANT),)
 
 PROCESS_ARGS = \
 	--output-dir "output" \
 	--work-dir "workdir" \
 	--asr-model "$(ASR_MODEL)" \
-	--asr-compute-type "$(ASR_COMPUTE_TYPE)" \
-	$(ALIGN_FLAG) \
-	--no-speech-threshold $(NO_SPEECH_THRESHOLD) \
-	--logprob-threshold $(LOGPROB_THRESHOLD) \
+	$(ASR_QUANT_FLAG) \
 	--llm-model "$(LLM_MODEL)" \
 	--llm-quant "$(LLM_QUANT)" \
 	--llm-window-sec $(LLM_WINDOW_SEC) \
@@ -71,8 +65,11 @@ help:
 	@echo "make run-local LOCAL_FILES='path/to/my/video.mp4' ASR_MODEL='medium'"
 
 install:
-	@echo "--- Installation des dépendances ---"
+	@echo "--- Installation des dépendances (version CPU pour contourner les limites de disque) ---"
 	$(PIP) install --upgrade pip
+	# Installer PyTorch et torchaudio pour CPU d'abord pour éviter les grosses dépendances CUDA
+	$(PIP) install torch torchaudio --extra-index-url https://download.pytorch.org/whl/cpu
+	# Installer le reste des dépendances
 	$(PIP) install -r requirements.txt
 	@echo "--- Dépendances installées ---"
 
